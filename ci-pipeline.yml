@@ -1,0 +1,130 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install project
+        run: |
+          uv sync
+
+      - name: Build package
+        run: |
+          uv build
+
+      - name: Verify installation
+        run: |
+          uv pip list | grep ci-cd-tracking
+          uv run python -c "import ci_cd_tracking; print(f'Successfully installed ci-cd-tracking')"
+
+      - name: Cache uv environment
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-environment
+          path: |
+            dist/
+            uv.lock
+          retention-days: 7
+
+  semantic-release-dry-run:
+    name: Semantic Release Dry Run
+    runs-on: ubuntu-latest
+    needs: build
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-environment
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Restore uv environment cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install semantic-release
+        run: |
+          uv pip install python-semantic-release
+
+      - name: Run semantic release (dry-run)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          uv run semantic-release version --no-push --no-commit --no-tag --print
+
+      - name: Get next version
+        id: next-version
+        run: |
+          VERSION=$(uv run semantic-release version --no-push --no-commit --no-tag --print 2>&1 | grep -oP '(?<=Next version: )\d+\.\d+\.\d+' || echo "No version change")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "### Semantic Release Preview" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Version:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request' && steps.next-version.outputs.version != 'No version change'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🎯 Semantic Release Preview\n\n**Next Version:** \`${{ steps.next-version.outputs.version }}\`\n\nThis is a dry-run preview. No release will be created from this PR.`
+            })

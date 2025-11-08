@@ -4,10 +4,8 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "ci-cd-tracking"
-source = { virtual = "." }
-
-[package.dev-dependencies]
-dev = [
+source = { editable = "." }
+dependencies = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
@@ -16,14 +14,12 @@ dev = [
 ]
 
 [package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
+requires-dist = [
     { name = "mypy", specifier = ">=1.18.2" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "ruff", specifier = ">=0.14.4" },
     { name = "setuptools", specifier = ">=80.9.0" },
-    { name = "setuptools-scm" },
+    { name = "setuptools-scm", specifier = ">=9.2.2" },
 ]
 
 [[package]]

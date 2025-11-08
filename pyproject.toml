@@ -8,16 +8,14 @@ dynamic = ["version"]
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
-
-[dependency-groups]
-dev = [
+dependencies = [
     "mypy>=1.18.2",
     "pytest>=8.4.2",
     "ruff>=0.14.4",
     "setuptools>=80.9.0",
-    "setuptools-scm",
+    "setuptools-scm>=9.2.2",
 ]
+
 
 [tool.setuptools]
 package-dir = {"" = "src"}
