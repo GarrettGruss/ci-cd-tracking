@@ -1,0 +1,101 @@
+name: Run Pytest
+description: Run pytest with coverage and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  pytest_args:
+    description: 'Additional pytest arguments'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Test status (passed/failed)'
+    value: ${{ steps.test.outputs.status }}
+  coverage:
+    description: 'Test coverage percentage'
+    value: ${{ steps.coverage.outputs.percentage }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+
+    - name: Run pytest
+      id: test
+      shell: bash
+      continue-on-error: true
+      run: |
+        uv run pytest ${{ inputs.pytest_args }} --cov --cov-report=term --cov-report=json
+        TEST_EXIT_CODE=$?
+        if [ $TEST_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+        exit $TEST_EXIT_CODE
+
+    - name: Extract coverage
+      id: coverage
+      shell: bash
+      if: always()
+      run: |
+        if [ -f coverage.json ]; then
+          COVERAGE=$(python -c "import json; print(json.load(open('coverage.json'))['totals']['percent_covered'])")
+          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+        else
+          echo "percentage=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload coverage report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pytest-coverage-report
+        path: |
+          coverage.json
+          .coverage
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.test.outputs.status }}
+        extra_labels: '{"test_type": "pytest", "coverage": "${{ steps.coverage.outputs.percentage }}"}'
+        message: "Pytest ${{ steps.test.outputs.status }} with ${{ steps.coverage.outputs.percentage }}% coverage"
+
+    - name: Fail if tests failed
+      shell: bash
+      if: steps.test.outputs.status == 'failed'
+      run: exit 1

@@ -1,0 +1,146 @@
+name: Database Migrations
+description: Run database migrations and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  migration_tool:
+    description: 'Migration tool (alembic, django, flyway)'
+    required: false
+    default: 'alembic'
+  migration_command:
+    description: 'Migration command to run'
+    required: false
+    default: 'upgrade head'
+  database_url:
+    description: 'Database URL (optional, can use environment variable)'
+    required: false
+    default: ''
+  dry_run:
+    description: 'Run migrations in dry-run mode'
+    required: false
+    default: 'false'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Migration status (success/failed)'
+    value: ${{ steps.migrate.outputs.status }}
+  migrations_applied:
+    description: 'Number of migrations applied'
+    value: ${{ steps.migrate.outputs.migrations_applied }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+
+    - name: Run migrations
+      id: migrate
+      shell: bash
+      continue-on-error: true
+      env:
+        DATABASE_URL: ${{ inputs.database_url }}
+      run: |
+        if [ "${{ inputs.migration_tool }}" = "alembic" ]; then
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            uv run alembic upgrade head --sql > migration_plan.sql
+            MIGRATIONS=$(grep -c "CREATE TABLE\|ALTER TABLE\|DROP TABLE" migration_plan.sql || echo "0")
+            cat migration_plan.sql
+            MIGRATE_EXIT_CODE=0
+          else
+            uv run alembic ${{ inputs.migration_command }} > migration_output.txt 2>&1
+            MIGRATE_EXIT_CODE=$?
+            MIGRATIONS=$(grep -c "Running upgrade" migration_output.txt || echo "0")
+            cat migration_output.txt
+          fi
+        elif [ "${{ inputs.migration_tool }}" = "django" ]; then
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            uv run python manage.py migrate --plan > migration_plan.txt
+            MIGRATIONS=$(grep -c "Planned operations" migration_plan.txt || echo "0")
+            MIGRATE_EXIT_CODE=0
+          else
+            uv run python manage.py migrate > migration_output.txt 2>&1
+            MIGRATE_EXIT_CODE=$?
+            MIGRATIONS=$(grep -c "Applying" migration_output.txt || echo "0")
+            cat migration_output.txt
+          fi
+        else
+          echo "Unsupported migration tool: ${{ inputs.migration_tool }}"
+          MIGRATIONS=0
+          MIGRATE_EXIT_CODE=1
+        fi
+
+        echo "migrations_applied=$MIGRATIONS" >> $GITHUB_OUTPUT
+
+        if [ $MIGRATE_EXIT_CODE -eq 0 ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+        exit $MIGRATE_EXIT_CODE
+
+    - name: Create migration summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Database Migrations" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Tool:** ${{ inputs.migration_tool }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.migrate.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Migrations Applied:** ${{ steps.migrate.outputs.migrations_applied }}" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "**Mode:** Dry Run" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Upload migration logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: migration-logs
+        path: |
+          migration_output.txt
+          migration_plan.sql
+          migration_plan.txt
+        retention-days: 30
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.migrate.outputs.status }}
+        extra_labels: '{"operation_type": "database_migration", "tool": "${{ inputs.migration_tool }}", "migrations_applied": "${{ steps.migrate.outputs.migrations_applied }}", "dry_run": "${{ inputs.dry_run }}"}'
+        message: "Database migration ${{ steps.migrate.outputs.status }}, ${{ steps.migrate.outputs.migrations_applied }} migrations applied using ${{ inputs.migration_tool }}"
+
+    - name: Fail if migration failed
+      shell: bash
+      if: steps.migrate.outputs.status == 'failed'
+      run: exit 1

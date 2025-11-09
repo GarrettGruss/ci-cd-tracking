@@ -1,0 +1,130 @@
+name: SBOM Generation
+description: Generate Software Bill of Materials (SBOM) and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  sbom_format:
+    description: 'SBOM format (cyclonedx-json, cyclonedx-xml, spdx-json)'
+    required: false
+    default: 'cyclonedx-json'
+  output_file:
+    description: 'Output file name'
+    required: false
+    default: 'sbom.json'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'SBOM generation status'
+    value: ${{ steps.generate.outputs.status }}
+  component_count:
+    description: 'Number of components in SBOM'
+    value: ${{ steps.generate.outputs.component_count }}
+  sbom_path:
+    description: 'Path to generated SBOM'
+    value: ${{ inputs.output_file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+        uv pip install cyclonedx-bom
+
+    - name: Generate SBOM
+      id: generate
+      shell: bash
+      continue-on-error: true
+      run: |
+        case "${{ inputs.sbom_format }}" in
+          "cyclonedx-json")
+            uv run cyclonedx-py -o ${{ inputs.output_file }} -F json
+            ;;
+          "cyclonedx-xml")
+            uv run cyclonedx-py -o ${{ inputs.output_file }} -F xml
+            ;;
+          "spdx-json")
+            echo "SPDX format not yet supported, using CycloneDX JSON"
+            uv run cyclonedx-py -o ${{ inputs.output_file }} -F json
+            ;;
+        esac
+
+        SBOM_EXIT_CODE=$?
+
+        if [ $SBOM_EXIT_CODE -eq 0 ] && [ -f ${{ inputs.output_file }} ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+
+          # Count components
+          if [[ "${{ inputs.sbom_format }}" == *"json"* ]]; then
+            COMPONENTS=$(jq '.components | length' ${{ inputs.output_file }} 2>/dev/null || echo "0")
+          else
+            COMPONENTS="N/A"
+          fi
+          echo "component_count=$COMPONENTS" >> $GITHUB_OUTPUT
+          echo "Generated SBOM with $COMPONENTS components"
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "component_count=0" >> $GITHUB_OUTPUT
+          echo "Failed to generate SBOM"
+        fi
+
+        exit $SBOM_EXIT_CODE
+
+    - name: Create SBOM summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### SBOM Generation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Format:** ${{ inputs.sbom_format }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Components:** ${{ steps.generate.outputs.component_count }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.generate.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload SBOM
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sbom
+        path: ${{ inputs.output_file }}
+        retention-days: 90
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.generate.outputs.status }}
+        extra_labels: '{"build_type": "sbom", "format": "${{ inputs.sbom_format }}", "components": "${{ steps.generate.outputs.component_count }}"}'
+        message: "SBOM generation ${{ steps.generate.outputs.status }}, ${{ steps.generate.outputs.component_count }} components, format: ${{ inputs.sbom_format }}"
+
+    - name: Fail if generation failed
+      shell: bash
+      if: steps.generate.outputs.status == 'failed'
+      run: exit 1

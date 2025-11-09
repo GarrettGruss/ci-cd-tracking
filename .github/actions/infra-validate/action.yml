@@ -1,0 +1,131 @@
+name: Infrastructure Validation
+description: Validate infrastructure as code (Terraform, Ansible, CloudFormation) and push results to Loki
+
+inputs:
+  tool:
+    description: 'Infrastructure tool (terraform, ansible, cloudformation)'
+    required: false
+    default: 'terraform'
+  working_directory:
+    description: 'Working directory for infrastructure code'
+    required: false
+    default: './infrastructure'
+  validation_command:
+    description: 'Custom validation command'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Validation status (passed/failed)'
+    value: ${{ steps.validate.outputs.status }}
+  changes_detected:
+    description: 'Whether changes were detected'
+    value: ${{ steps.validate.outputs.changes_detected }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Terraform
+      if: inputs.tool == 'terraform'
+      uses: hashicorp/setup-terraform@v3
+
+    - name: Validate infrastructure
+      id: validate
+      shell: bash
+      continue-on-error: true
+      run: |
+        cd ${{ inputs.working_directory }}
+
+        if [ -n "${{ inputs.validation_command }}" ]; then
+          eval "${{ inputs.validation_command }}"
+          VALIDATE_EXIT_CODE=$?
+          echo "changes_detected=unknown" >> $GITHUB_OUTPUT
+        elif [ "${{ inputs.tool }}" = "terraform" ]; then
+          # Terraform validation
+          terraform init -backend=false
+          terraform fmt -check > terraform_fmt.txt 2>&1
+          FMT_EXIT_CODE=$?
+
+          terraform validate > terraform_validate.txt 2>&1
+          VALIDATE_EXIT_CODE=$?
+
+          terraform plan -detailed-exitcode > terraform_plan.txt 2>&1
+          PLAN_EXIT_CODE=$?
+
+          # detailed-exitcode: 0 = no changes, 1 = error, 2 = changes
+          if [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+          elif [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+          else
+            echo "changes_detected=unknown" >> $GITHUB_OUTPUT
+          fi
+
+          cat terraform_fmt.txt terraform_validate.txt terraform_plan.txt
+
+          VALIDATE_EXIT_CODE=$((FMT_EXIT_CODE + VALIDATE_EXIT_CODE))
+        elif [ "${{ inputs.tool }}" = "ansible" ]; then
+          # Ansible validation
+          ansible-playbook --syntax-check playbook.yml > ansible_check.txt 2>&1
+          VALIDATE_EXIT_CODE=$?
+          echo "changes_detected=unknown" >> $GITHUB_OUTPUT
+          cat ansible_check.txt
+        else
+          echo "Unsupported infrastructure tool: ${{ inputs.tool }}"
+          VALIDATE_EXIT_CODE=1
+          echo "changes_detected=unknown" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $VALIDATE_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+        exit $VALIDATE_EXIT_CODE
+
+    - name: Create validation summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Infrastructure Validation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Tool:** ${{ inputs.tool }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.validate.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Changes Detected:** ${{ steps.validate.outputs.changes_detected }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload validation results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: infrastructure-validation
+        path: |
+          ${{ inputs.working_directory }}/*.txt
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.validate.outputs.status }}
+        extra_labels: '{"operation_type": "infrastructure_validation", "tool": "${{ inputs.tool }}", "changes_detected": "${{ steps.validate.outputs.changes_detected }}"}'
+        message: "Infrastructure validation ${{ steps.validate.outputs.status }} using ${{ inputs.tool }}, changes detected: ${{ steps.validate.outputs.changes_detected }}"
+
+    - name: Fail if validation failed
+      shell: bash
+      if: steps.validate.outputs.status == 'failed'
+      run: exit 1

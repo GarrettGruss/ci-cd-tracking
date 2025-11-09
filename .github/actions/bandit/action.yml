@@ -1,0 +1,121 @@
+name: Run Bandit Security Scanner
+description: Run bandit security linter and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  path:
+    description: 'Path to scan (default: src)'
+    required: false
+    default: 'src'
+  severity_level:
+    description: 'Minimum severity level to report (low, medium, high)'
+    required: false
+    default: 'low'
+  confidence_level:
+    description: 'Minimum confidence level to report (low, medium, high)'
+    required: false
+    default: 'low'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Security scan status (passed/failed)'
+    value: ${{ steps.scan.outputs.status }}
+  issues:
+    description: 'Number of security issues found'
+    value: ${{ steps.scan.outputs.issues }}
+  severity_high:
+    description: 'Number of high severity issues'
+    value: ${{ steps.scan.outputs.severity_high }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install bandit
+      shell: bash
+      run: |
+        uv pip install bandit
+
+    - name: Run bandit
+      id: scan
+      shell: bash
+      continue-on-error: true
+      run: |
+        uv run bandit -r ${{ inputs.path }} \
+          -ll -ii \
+          -f json -o bandit_results.json \
+          --severity-level ${{ inputs.severity_level }} \
+          --confidence-level ${{ inputs.confidence_level }} || true
+
+        uv run bandit -r ${{ inputs.path }} \
+          --severity-level ${{ inputs.severity_level }} \
+          --confidence-level ${{ inputs.confidence_level }} > bandit_output.txt 2>&1
+        BANDIT_EXIT_CODE=$?
+
+        # Parse results
+        if [ -f bandit_results.json ]; then
+          ISSUES=$(python -c "import json; data=json.load(open('bandit_results.json')); print(len(data.get('results', [])))")
+          HIGH_SEVERITY=$(python -c "import json; data=json.load(open('bandit_results.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']))")
+          echo "issues=$ISSUES" >> $GITHUB_OUTPUT
+          echo "severity_high=$HIGH_SEVERITY" >> $GITHUB_OUTPUT
+        else
+          echo "issues=0" >> $GITHUB_OUTPUT
+          echo "severity_high=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $BANDIT_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat bandit_output.txt
+        fi
+        exit $BANDIT_EXIT_CODE
+
+    - name: Upload bandit results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bandit-security-report
+        path: |
+          bandit_results.json
+          bandit_output.txt
+        retention-days: 30
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.scan.outputs.status }}
+        extra_labels: '{"security_tool": "bandit", "issues": "${{ steps.scan.outputs.issues }}", "high_severity": "${{ steps.scan.outputs.severity_high }}"}'
+        message: "Bandit security scan ${{ steps.scan.outputs.status }}, ${{ steps.scan.outputs.issues }} issues (${{ steps.scan.outputs.severity_high }} high severity)"
+
+    - name: Fail if security issues found
+      shell: bash
+      if: steps.scan.outputs.status == 'failed'
+      run: exit 1

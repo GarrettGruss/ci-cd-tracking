@@ -1,0 +1,99 @@
+name: Coverage Threshold Enforcer
+description: Enforce minimum code coverage thresholds and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  minimum_coverage:
+    description: 'Minimum coverage percentage required'
+    required: false
+    default: '80'
+  coverage_file:
+    description: 'Path to coverage.json file'
+    required: false
+    default: 'coverage.json'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Coverage check status (passed/failed)'
+    value: ${{ steps.check.outputs.status }}
+  coverage:
+    description: 'Current coverage percentage'
+    value: ${{ steps.check.outputs.coverage }}
+  threshold:
+    description: 'Required threshold'
+    value: ${{ inputs.minimum_coverage }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Check coverage threshold
+      id: check
+      shell: bash
+      run: |
+        if [ ! -f ${{ inputs.coverage_file }} ]; then
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "coverage=0" >> $GITHUB_OUTPUT
+          echo "Coverage file not found: ${{ inputs.coverage_file }}"
+          exit 1
+        fi
+
+        COVERAGE=$(python -c "import json; print(json.load(open('${{ inputs.coverage_file }}'))['totals']['percent_covered'])")
+        echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+
+        echo "Current coverage: $COVERAGE%"
+        echo "Required threshold: ${{ inputs.minimum_coverage }}%"
+
+        if (( $(echo "$COVERAGE >= ${{ inputs.minimum_coverage }}" | bc -l) )); then
+          echo "status=passed" >> $GITHUB_OUTPUT
+          echo "Coverage threshold met!"
+          exit 0
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "Coverage below threshold!"
+          exit 1
+        fi
+
+    - name: Create coverage summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Coverage Threshold Check" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Current Coverage:** ${{ steps.check.outputs.coverage }}%" >> $GITHUB_STEP_SUMMARY
+        echo "**Required Threshold:** ${{ inputs.minimum_coverage }}%" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.check.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.check.outputs.status }}
+        extra_labels: '{"check_type": "coverage_threshold", "coverage": "${{ steps.check.outputs.coverage }}", "threshold": "${{ inputs.minimum_coverage }}"}'
+        message: "Coverage threshold check ${{ steps.check.outputs.status }}, coverage: ${{ steps.check.outputs.coverage }}%, threshold: ${{ inputs.minimum_coverage }}%"
+
+    - name: Fail if below threshold
+      shell: bash
+      if: steps.check.outputs.status == 'failed'
+      run: exit 1

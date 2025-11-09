@@ -1,0 +1,158 @@
+name: Send Notifications
+description: Send notifications to Slack/Discord/Teams and push to Loki
+
+inputs:
+  platform:
+    description: 'Notification platform (slack, discord, teams)'
+    required: true
+  webhook_url:
+    description: 'Webhook URL for notifications'
+    required: true
+  status:
+    description: 'Status to report (success, failure, warning)'
+    required: true
+  title:
+    description: 'Notification title'
+    required: false
+    default: 'GitHub Actions Notification'
+  message:
+    description: 'Notification message'
+    required: true
+  color:
+    description: 'Notification color (success=green, failure=red, warning=yellow)'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  notification_status:
+    description: 'Notification send status'
+    value: ${{ steps.send.outputs.notification_status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Determine color
+      id: color
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.color }}" ]; then
+          COLOR="${{ inputs.color }}"
+        else
+          case "${{ inputs.status }}" in
+            "success") COLOR="good" ;;
+            "failure") COLOR="danger" ;;
+            "warning") COLOR="warning" ;;
+            *) COLOR="#808080" ;;
+          esac
+        fi
+        echo "color=$COLOR" >> $GITHUB_OUTPUT
+
+    - name: Send notification
+      id: send
+      shell: bash
+      continue-on-error: true
+      run: |
+        case "${{ inputs.platform }}" in
+          "slack")
+            curl -X POST "${{ inputs.webhook_url }}" \
+              -H "Content-Type: application/json" \
+              -d @- <<EOF
+            {
+              "attachments": [{
+                "color": "${{ steps.color.outputs.color }}",
+                "title": "${{ inputs.title }}",
+                "text": "${{ inputs.message }}",
+                "fields": [
+                  {"title": "Repository", "value": "${{ github.repository }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Workflow", "value": "${{ github.workflow }}", "short": true},
+                  {"title": "Status", "value": "${{ inputs.status }}", "short": true}
+                ],
+                "footer": "GitHub Actions",
+                "footer_icon": "https://github.com/favicon.ico"
+              }]
+            }
+        EOF
+            ;;
+          "discord")
+            # Convert color to hex for Discord
+            case "${{ steps.color.outputs.color }}" in
+              "good") HEX_COLOR="3066993" ;;
+              "danger") HEX_COLOR="15158332" ;;
+              "warning") HEX_COLOR="16776960" ;;
+              *) HEX_COLOR="8421504" ;;
+            esac
+
+            curl -X POST "${{ inputs.webhook_url }}" \
+              -H "Content-Type: application/json" \
+              -d @- <<EOF
+            {
+              "embeds": [{
+                "title": "${{ inputs.title }}",
+                "description": "${{ inputs.message }}",
+                "color": $HEX_COLOR,
+                "fields": [
+                  {"name": "Repository", "value": "${{ github.repository }}", "inline": true},
+                  {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                  {"name": "Workflow", "value": "${{ github.workflow }}", "inline": true},
+                  {"name": "Status", "value": "${{ inputs.status }}", "inline": true}
+                ],
+                "footer": {"text": "GitHub Actions"}
+              }]
+            }
+        EOF
+            ;;
+          "teams")
+            curl -X POST "${{ inputs.webhook_url }}" \
+              -H "Content-Type: application/json" \
+              -d @- <<EOF
+            {
+              "@type": "MessageCard",
+              "@context": "https://schema.org/extensions",
+              "summary": "${{ inputs.title }}",
+              "themeColor": "${{ steps.color.outputs.color }}",
+              "title": "${{ inputs.title }}",
+              "text": "${{ inputs.message }}",
+              "sections": [{
+                "facts": [
+                  {"name": "Repository", "value": "${{ github.repository }}"},
+                  {"name": "Branch", "value": "${{ github.ref_name }}"},
+                  {"name": "Workflow", "value": "${{ github.workflow }}"},
+                  {"name": "Status", "value": "${{ inputs.status }}"}
+                ]
+              }]
+            }
+        EOF
+            ;;
+        esac
+
+        NOTIFY_EXIT_CODE=$?
+
+        if [ $NOTIFY_EXIT_CODE -eq 0 ]; then
+          echo "notification_status=sent" >> $GITHUB_OUTPUT
+        else
+          echo "notification_status=failed" >> $GITHUB_OUTPUT
+        fi
+        exit $NOTIFY_EXIT_CODE
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.send.outputs.notification_status }}
+        extra_labels: '{"operation_type": "notification", "platform": "${{ inputs.platform }}", "status": "${{ inputs.status }}"}'
+        message: "Notification ${{ steps.send.outputs.notification_status }} via ${{ inputs.platform }}, status: ${{ inputs.status }}"

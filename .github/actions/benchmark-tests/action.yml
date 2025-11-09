@@ -1,0 +1,118 @@
+name: Performance Benchmark Tests
+description: Run performance benchmarks with pytest-benchmark and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  test_path:
+    description: 'Path to benchmark tests'
+    required: false
+    default: 'tests/benchmarks'
+  compare_to:
+    description: 'Baseline benchmark to compare against (commit hash or branch)'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Benchmark status (passed/failed)'
+    value: ${{ steps.benchmark.outputs.status }}
+  benchmarks_run:
+    description: 'Number of benchmarks executed'
+    value: ${{ steps.benchmark.outputs.benchmarks_run }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+        uv pip install pytest-benchmark
+
+    - name: Run benchmarks
+      id: benchmark
+      shell: bash
+      continue-on-error: true
+      run: |
+        uv run pytest ${{ inputs.test_path }} \
+          --benchmark-only \
+          --benchmark-json=benchmark-results.json \
+          --benchmark-autosave
+        BENCHMARK_EXIT_CODE=$?
+
+        # Parse results
+        if [ -f benchmark-results.json ]; then
+          BENCHMARKS=$(jq '.benchmarks | length' benchmark-results.json)
+          echo "benchmarks_run=$BENCHMARKS" >> $GITHUB_OUTPUT
+        else
+          echo "benchmarks_run=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $BENCHMARK_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+        exit $BENCHMARK_EXIT_CODE
+
+    - name: Create benchmark summary
+      if: always()
+      shell: bash
+      run: |
+        if [ -f benchmark-results.json ]; then
+          echo "### Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Benchmarks Run:** ${{ steps.benchmark.outputs.benchmarks_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          jq -r '.benchmarks[] | "- **\(.name)**: \(.stats.mean)s (mean)"' benchmark-results.json >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Upload benchmark results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: |
+          benchmark-results.json
+          .benchmarks/
+        retention-days: 30
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.benchmark.outputs.status }}
+        extra_labels: '{"test_type": "benchmark", "benchmarks_run": "${{ steps.benchmark.outputs.benchmarks_run }}"}'
+        message: "Benchmark tests ${{ steps.benchmark.outputs.status }}, ${{ steps.benchmark.outputs.benchmarks_run }} benchmarks executed"
+
+    - name: Fail if benchmarks failed
+      shell: bash
+      if: steps.benchmark.outputs.status == 'failed'
+      run: exit 1

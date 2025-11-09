@@ -1,0 +1,114 @@
+name: Semantic Release Dry Run
+description: Run semantic-release in dry-run mode and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  github_token:
+    description: 'GitHub token for semantic-release'
+    required: true
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+  post_pr_comment:
+    description: 'Post PR comment with next version'
+    required: false
+    default: 'true'
+
+outputs:
+  next_version:
+    description: 'Next version that would be released'
+    value: ${{ steps.version.outputs.next_version }}
+  status:
+    description: 'Semantic release status'
+    value: ${{ steps.release.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install semantic-release
+      shell: bash
+      run: |
+        uv pip install python-semantic-release
+
+    - name: Run semantic release (dry-run)
+      id: release
+      shell: bash
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        uv run semantic-release version --no-push --no-commit --no-tag --print > semantic_release_output.txt 2>&1
+        RELEASE_EXIT_CODE=$?
+
+        if [ $RELEASE_EXIT_CODE -eq 0 ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat semantic_release_output.txt
+        fi
+        exit $RELEASE_EXIT_CODE
+
+    - name: Get next version
+      id: version
+      shell: bash
+      if: always()
+      run: |
+        if [ -f semantic_release_output.txt ]; then
+          VERSION=$(grep -oP '(?<=Next version: )\d+\.\d+\.\d+' semantic_release_output.txt || echo "No version change")
+        else
+          VERSION="No version change"
+        fi
+        echo "next_version=$VERSION" >> $GITHUB_OUTPUT
+        echo "### Semantic Release Preview" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Next Version:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+
+    - name: Comment PR
+      if: always() && github.event_name == 'pull_request' && steps.version.outputs.next_version != 'No version change' && inputs.post_pr_comment == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## 🎯 Semantic Release Preview\n\n**Next Version:** \`${{ steps.version.outputs.next_version }}\`\n\nThis is a dry-run preview. No release will be created from this PR.`
+          })
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.release.outputs.status }}
+        extra_labels: '{"release_type": "semantic_release_dry_run", "next_version": "${{ steps.version.outputs.next_version }}"}'
+        message: "Semantic release dry-run ${{ steps.release.outputs.status }}, next version: ${{ steps.version.outputs.next_version }}"
+
+    - name: Fail if release check failed
+      shell: bash
+      if: steps.release.outputs.status == 'failed'
+      run: exit 1

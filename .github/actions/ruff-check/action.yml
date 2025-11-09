@@ -1,0 +1,102 @@
+name: Run Ruff Check
+description: Run ruff linter check and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  fix:
+    description: 'Automatically fix issues'
+    required: false
+    default: 'false'
+  path:
+    description: 'Path to check (default: .)'
+    required: false
+    default: '.'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Lint check status (passed/failed)'
+    value: ${{ steps.check.outputs.status }}
+  violations:
+    description: 'Number of lint violations found'
+    value: ${{ steps.check.outputs.violations }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+
+    - name: Run ruff check
+      id: check
+      shell: bash
+      continue-on-error: true
+      run: |
+        if [ "${{ inputs.fix }}" = "true" ]; then
+          uv run ruff check --fix ${{ inputs.path }} > ruff_check_output.txt 2>&1
+          CHECK_EXIT_CODE=$?
+        else
+          uv run ruff check ${{ inputs.path }} > ruff_check_output.txt 2>&1
+          CHECK_EXIT_CODE=$?
+        fi
+
+        # Count violations
+        VIOLATIONS=$(grep -c "^.*:.*:.*:" ruff_check_output.txt || echo "0")
+        echo "violations=$VIOLATIONS" >> $GITHUB_OUTPUT
+
+        if [ $CHECK_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat ruff_check_output.txt
+        fi
+        exit $CHECK_EXIT_CODE
+
+    - name: Upload ruff results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ruff-check-results
+        path: ruff_check_output.txt
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.check.outputs.status }}
+        extra_labels: '{"check_type": "ruff_check", "violations": "${{ steps.check.outputs.violations }}"}'
+        message: "Ruff check ${{ steps.check.outputs.status }}, ${{ steps.check.outputs.violations }} violations found"
+
+    - name: Fail if lint check failed
+      shell: bash
+      if: steps.check.outputs.status == 'failed'
+      run: exit 1

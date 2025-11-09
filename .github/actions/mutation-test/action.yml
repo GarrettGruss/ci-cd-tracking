@@ -1,0 +1,131 @@
+name: Mutation Testing
+description: Run mutation tests with mutmut and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  paths_to_mutate:
+    description: 'Paths to mutate (comma-separated)'
+    required: false
+    default: 'src/'
+  test_command:
+    description: 'Command to run tests'
+    required: false
+    default: 'pytest tests/'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Mutation test status (passed/failed)'
+    value: ${{ steps.test.outputs.status }}
+  mutation_score:
+    description: 'Mutation score percentage'
+    value: ${{ steps.test.outputs.mutation_score }}
+  killed:
+    description: 'Number of killed mutants'
+    value: ${{ steps.test.outputs.killed }}
+  survived:
+    description: 'Number of survived mutants'
+    value: ${{ steps.test.outputs.survived }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+        uv pip install mutmut
+
+    - name: Run mutation tests
+      id: test
+      shell: bash
+      continue-on-error: true
+      run: |
+        # Run mutmut
+        uv run mutmut run --paths-to-mutate=${{ inputs.paths_to_mutate }} --runner="${{ inputs.test_command }}" || true
+
+        # Get results
+        uv run mutmut results > mutation-results.txt
+        uv run mutmut junitxml > mutation-results.xml
+
+        # Parse results
+        KILLED=$(grep -c "Status: killed" mutation-results.txt || echo "0")
+        SURVIVED=$(grep -c "Status: survived" mutation-results.txt || echo "0")
+        TIMEOUT=$(grep -c "Status: timeout" mutation-results.txt || echo "0")
+        TOTAL=$((KILLED + SURVIVED + TIMEOUT))
+
+        if [ $TOTAL -gt 0 ]; then
+          MUTATION_SCORE=$(echo "scale=2; ($KILLED / $TOTAL) * 100" | bc)
+        else
+          MUTATION_SCORE=0
+        fi
+
+        echo "killed=$KILLED" >> $GITHUB_OUTPUT
+        echo "survived=$SURVIVED" >> $GITHUB_OUTPUT
+        echo "mutation_score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
+
+        if [ "$SURVIVED" -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "Mutation testing found $SURVIVED surviving mutants"
+        fi
+
+    - name: Create mutation summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Mutation Testing Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Mutation Score:** ${{ steps.test.outputs.mutation_score }}%" >> $GITHUB_STEP_SUMMARY
+        echo "**Killed:** ${{ steps.test.outputs.killed }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Survived:** ${{ steps.test.outputs.survived }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload mutation results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mutation-test-results
+        path: |
+          mutation-results.txt
+          mutation-results.xml
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.test.outputs.status }}
+        extra_labels: '{"test_type": "mutation", "mutation_score": "${{ steps.test.outputs.mutation_score }}", "killed": "${{ steps.test.outputs.killed }}", "survived": "${{ steps.test.outputs.survived }}"}'
+        message: "Mutation test ${{ steps.test.outputs.status }}, score: ${{ steps.test.outputs.mutation_score }}%, killed: ${{ steps.test.outputs.killed }}, survived: ${{ steps.test.outputs.survived }}"
+
+    - name: Fail if mutants survived
+      shell: bash
+      if: steps.test.outputs.status == 'failed'
+      run: exit 1

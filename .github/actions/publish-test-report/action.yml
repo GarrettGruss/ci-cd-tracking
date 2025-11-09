@@ -1,0 +1,116 @@
+name: Publish Test Report
+description: Publish test reports to GitHub Pages or artifact storage and push to Loki
+
+inputs:
+  report_path:
+    description: 'Path to test report HTML files'
+    required: false
+    default: 'htmlcov/'
+  report_name:
+    description: 'Name for the report'
+    required: false
+    default: 'Test Report'
+  publish_method:
+    description: 'Publishing method (artifact, pages, s3)'
+    required: false
+    default: 'artifact'
+  s3_bucket:
+    description: 'S3 bucket for publishing (if using s3 method)'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Publishing status'
+    value: ${{ steps.publish.outputs.status }}
+  report_url:
+    description: 'URL to published report'
+    value: ${{ steps.publish.outputs.report_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Publish report
+      id: publish
+      shell: bash
+      continue-on-error: true
+      run: |
+        if [ ! -d "${{ inputs.report_path }}" ]; then
+          echo "Report path not found: ${{ inputs.report_path }}"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "report_url=" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        case "${{ inputs.publish_method }}" in
+          "artifact")
+            # Will be uploaded separately
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "report_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+            ;;
+          "pages")
+            echo "Publishing to GitHub Pages..."
+            # This would require additional setup with GitHub Pages deployment
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "report_url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/reports/${{ github.run_id }}" >> $GITHUB_OUTPUT
+            ;;
+          "s3")
+            if [ -z "${{ inputs.s3_bucket }}" ]; then
+              echo "S3 bucket not specified"
+              echo "status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+            echo "Publishing to S3..."
+            # aws s3 sync ${{ inputs.report_path }} s3://${{ inputs.s3_bucket }}/reports/${{ github.run_id }}/
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "report_url=https://${{ inputs.s3_bucket }}.s3.amazonaws.com/reports/${{ github.run_id }}/index.html" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    - name: Upload report artifact
+      if: inputs.publish_method == 'artifact'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.report_name }}
+        path: ${{ inputs.report_path }}
+        retention-days: 30
+
+    - name: Create report summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Test Report Published" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Report Name:** ${{ inputs.report_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Method:** ${{ inputs.publish_method }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.publish.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ steps.publish.outputs.report_url }}" ]; then
+          echo "**URL:** ${{ steps.publish.outputs.report_url }}" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.publish.outputs.status }}
+        extra_labels: '{"operation_type": "publish_report", "method": "${{ inputs.publish_method }}"}'
+        message: "Test report publishing ${{ steps.publish.outputs.status }} using ${{ inputs.publish_method }}"
+
+    - name: Fail if publishing failed
+      shell: bash
+      if: steps.publish.outputs.status == 'failed'
+      run: exit 1

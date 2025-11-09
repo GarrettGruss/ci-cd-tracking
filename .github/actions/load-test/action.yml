@@ -1,0 +1,133 @@
+name: Load Testing
+description: Run load tests with Locust and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  locustfile:
+    description: 'Path to locustfile'
+    required: false
+    default: 'tests/load/locustfile.py'
+  host:
+    description: 'Target host URL'
+    required: true
+  users:
+    description: 'Number of concurrent users'
+    required: false
+    default: '100'
+  spawn_rate:
+    description: 'User spawn rate (users per second)'
+    required: false
+    default: '10'
+  run_time:
+    description: 'Test duration (e.g., 60s, 5m)'
+    required: false
+    default: '60s'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Load test status (passed/failed)'
+    value: ${{ steps.test.outputs.status }}
+  requests_total:
+    description: 'Total requests made'
+    value: ${{ steps.test.outputs.requests_total }}
+  failure_rate:
+    description: 'Failure rate percentage'
+    value: ${{ steps.test.outputs.failure_rate }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+        uv pip install locust
+
+    - name: Run load tests
+      id: test
+      shell: bash
+      continue-on-error: true
+      run: |
+        uv run locust \
+          -f ${{ inputs.locustfile }} \
+          --host ${{ inputs.host }} \
+          --users ${{ inputs.users }} \
+          --spawn-rate ${{ inputs.spawn_rate }} \
+          --run-time ${{ inputs.run_time }} \
+          --headless \
+          --html=load-test-report.html \
+          --csv=load-test-stats
+        LOCUST_EXIT_CODE=$?
+
+        # Parse stats
+        if [ -f load-test-stats_stats.csv ]; then
+          TOTAL_REQUESTS=$(tail -n +2 load-test-stats_stats.csv | awk -F',' '{sum+=$2} END {print sum}')
+          TOTAL_FAILURES=$(tail -n +2 load-test-stats_stats.csv | awk -F',' '{sum+=$3} END {print sum}')
+          if [ "$TOTAL_REQUESTS" -gt 0 ]; then
+            FAILURE_RATE=$(echo "scale=2; ($TOTAL_FAILURES / $TOTAL_REQUESTS) * 100" | bc)
+          else
+            FAILURE_RATE=0
+          fi
+          echo "requests_total=$TOTAL_REQUESTS" >> $GITHUB_OUTPUT
+          echo "failure_rate=$FAILURE_RATE" >> $GITHUB_OUTPUT
+        else
+          echo "requests_total=0" >> $GITHUB_OUTPUT
+          echo "failure_rate=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $LOCUST_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+        exit $LOCUST_EXIT_CODE
+
+    - name: Upload load test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: load-test-results
+        path: |
+          load-test-report.html
+          load-test-stats*.csv
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.test.outputs.status }}
+        extra_labels: '{"test_type": "load", "users": "${{ inputs.users }}", "requests": "${{ steps.test.outputs.requests_total }}", "failure_rate": "${{ steps.test.outputs.failure_rate }}"}'
+        message: "Load test ${{ steps.test.outputs.status }}, ${{ steps.test.outputs.requests_total }} requests, ${{ steps.test.outputs.failure_rate }}% failure rate, ${{ inputs.users }} users"
+
+    - name: Fail if load test failed
+      shell: bash
+      if: steps.test.outputs.status == 'failed'
+      run: exit 1

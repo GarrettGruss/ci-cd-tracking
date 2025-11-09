@@ -1,0 +1,115 @@
+name: Dependency Update Checker
+description: Check for outdated dependencies and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  fail_on_outdated:
+    description: 'Fail if outdated dependencies are found'
+    required: false
+    default: 'false'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Dependency check status'
+    value: ${{ steps.check.outputs.status }}
+  outdated_count:
+    description: 'Number of outdated dependencies'
+    value: ${{ steps.check.outputs.outdated_count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+
+    - name: Check for outdated dependencies
+      id: check
+      shell: bash
+      run: |
+        # Export current dependencies
+        uv pip list --format=json > installed_packages.json
+
+        # Check for updates (uv doesn't have a built-in outdated command yet)
+        # Using pip list --outdated as fallback
+        uv pip list --outdated --format=json > outdated.json 2>/dev/null || echo "[]" > outdated.json
+
+        OUTDATED_COUNT=$(jq 'length' outdated.json)
+        echo "outdated_count=$OUTDATED_COUNT" >> $GITHUB_OUTPUT
+
+        if [ "$OUTDATED_COUNT" -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+          echo "All dependencies are up to date"
+        else
+          if [ "${{ inputs.fail_on_outdated }}" = "true" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+          else
+            echo "status=passed" >> $GITHUB_OUTPUT
+          fi
+          echo "Found $OUTDATED_COUNT outdated dependencies:"
+          jq -r '.[] | "\(.name): \(.version) -> \(.latest_version)"' outdated.json
+        fi
+
+    - name: Create dependency report
+      if: always()
+      shell: bash
+      run: |
+        echo "### Dependency Status" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Outdated Dependencies:** ${{ steps.check.outputs.outdated_count }}" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.check.outputs.outdated_count }}" != "0" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Outdated Packages" >> $GITHUB_STEP_SUMMARY
+          jq -r '.[] | "- **\(.name)**: \(.version) → \(.latest_version)"' outdated.json >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Upload dependency report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-report
+        path: |
+          installed_packages.json
+          outdated.json
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.check.outputs.status }}
+        extra_labels: '{"check_type": "dependencies", "outdated_count": "${{ steps.check.outputs.outdated_count }}"}'
+        message: "Dependency check ${{ steps.check.outputs.status }}, ${{ steps.check.outputs.outdated_count }} outdated packages"
+
+    - name: Fail if configured to fail on outdated
+      shell: bash
+      if: steps.check.outputs.status == 'failed'
+      run: exit 1

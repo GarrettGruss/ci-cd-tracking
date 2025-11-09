@@ -1,0 +1,130 @@
+name: Commit Message Linting
+description: Validate commit messages follow conventional commits and push results to Loki
+
+inputs:
+  config_file:
+    description: 'Path to commitlint config file'
+    required: false
+    default: ''
+  from_ref:
+    description: 'Start commit reference'
+    required: false
+    default: 'origin/main'
+  to_ref:
+    description: 'End commit reference'
+    required: false
+    default: 'HEAD'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Commitlint validation status (passed/failed)'
+    value: ${{ steps.lint.outputs.status }}
+  commits_checked:
+    description: 'Number of commits checked'
+    value: ${{ steps.lint.outputs.commits_checked }}
+  commits_invalid:
+    description: 'Number of invalid commits'
+    value: ${{ steps.lint.outputs.commits_invalid }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install commitlint
+      shell: bash
+      run: |
+        npm install -g @commitlint/cli @commitlint/config-conventional
+
+    - name: Create default config if needed
+      shell: bash
+      run: |
+        if [ ! -f "${{ inputs.config_file }}" ] && [ -z "${{ inputs.config_file }}" ]; then
+          cat > commitlint.config.js <<EOF
+        module.exports = {
+          extends: ['@commitlint/config-conventional'],
+          rules: {
+            'type-enum': [
+              2,
+              'always',
+              ['feat', 'fix', 'docs', 'style', 'refactor', 'perf', 'test', 'build', 'ci', 'chore', 'revert']
+            ]
+          }
+        };
+        EOF
+          CONFIG_FILE="commitlint.config.js"
+        else
+          CONFIG_FILE="${{ inputs.config_file }}"
+        fi
+        echo "CONFIG_FILE=$CONFIG_FILE" >> $GITHUB_ENV
+
+    - name: Lint commits
+      id: lint
+      shell: bash
+      continue-on-error: true
+      run: |
+        # Get commit range
+        git fetch origin ${{ inputs.from_ref }}
+        COMMITS=$(git log --format="%H" ${{ inputs.from_ref }}..${{ inputs.to_ref }})
+        COMMITS_COUNT=$(echo "$COMMITS" | grep -c . || echo "0")
+
+        echo "commits_checked=$COMMITS_COUNT" >> $GITHUB_OUTPUT
+
+        INVALID=0
+        echo "$COMMITS" | while read commit; do
+          MESSAGE=$(git log -1 --format=%B $commit)
+          echo "Checking commit: $commit"
+          echo "$MESSAGE" | commitlint --config $CONFIG_FILE || INVALID=$((INVALID + 1))
+        done
+
+        echo "commits_invalid=$INVALID" >> $GITHUB_OUTPUT
+
+        if [ $INVALID -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+          echo "All $COMMITS_COUNT commits follow conventional commit format"
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "$INVALID out of $COMMITS_COUNT commits do not follow conventional commit format"
+        fi
+
+        [ $INVALID -eq 0 ]
+
+    - name: Create commitlint summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Commit Message Linting" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.lint.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Commits Checked:** ${{ steps.lint.outputs.commits_checked }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Invalid Commits:** ${{ steps.lint.outputs.commits_invalid }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.lint.outputs.status }}
+        extra_labels: '{"check_type": "commitlint", "commits_checked": "${{ steps.lint.outputs.commits_checked }}", "commits_invalid": "${{ steps.lint.outputs.commits_invalid }}"}'
+        message: "Commit message linting ${{ steps.lint.outputs.status }}, ${{ steps.lint.outputs.commits_checked }} commits checked, ${{ steps.lint.outputs.commits_invalid }} invalid"
+
+    - name: Fail if commits are invalid
+      shell: bash
+      if: steps.lint.outputs.status == 'failed'
+      run: exit 1

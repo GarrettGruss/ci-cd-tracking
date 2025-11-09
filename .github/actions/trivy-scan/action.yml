@@ -1,0 +1,118 @@
+name: Run Trivy Container Scanner
+description: Scan container images for vulnerabilities with Trivy and push results to Loki
+
+inputs:
+  image:
+    description: 'Container image to scan'
+    required: true
+  severity:
+    description: 'Severity levels to scan for (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)'
+    required: false
+    default: 'CRITICAL,HIGH'
+  exit_code:
+    description: 'Exit code when vulnerabilities are found'
+    required: false
+    default: '1'
+  ignore_unfixed:
+    description: 'Ignore unfixed vulnerabilities'
+    required: false
+    default: 'false'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Scan status (passed/failed)'
+    value: ${{ steps.scan.outputs.status }}
+  critical:
+    description: 'Number of critical vulnerabilities'
+    value: ${{ steps.scan.outputs.critical }}
+  high:
+    description: 'Number of high vulnerabilities'
+    value: ${{ steps.scan.outputs.high }}
+  total:
+    description: 'Total vulnerabilities found'
+    value: ${{ steps.scan.outputs.total }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run Trivy scanner
+      id: scan
+      uses: aquasecurity/trivy-action@master
+      continue-on-error: true
+      with:
+        image-ref: ${{ inputs.image }}
+        format: 'json'
+        output: 'trivy-results.json'
+        severity: ${{ inputs.severity }}
+        exit-code: ${{ inputs.exit_code }}
+        ignore-unfixed: ${{ inputs.ignore_unfixed }}
+
+    - name: Parse results
+      id: parse
+      shell: bash
+      if: always()
+      run: |
+        if [ -f trivy-results.json ]; then
+          CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json)
+          TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-results.json)
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+          if [ "${{ steps.scan.outcome }}" = "success" ]; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "critical=0" >> $GITHUB_OUTPUT
+          echo "high=0" >> $GITHUB_OUTPUT
+          echo "total=0" >> $GITHUB_OUTPUT
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate human-readable report
+      shell: bash
+      if: always()
+      run: |
+        if [ -f trivy-results.json ]; then
+          jq -r '.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) - \(.Severity) - \(.PkgName)@\(.InstalledVersion)"' trivy-results.json > trivy-report.txt || echo "No vulnerabilities found" > trivy-report.txt
+        fi
+
+    - name: Upload Trivy results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-scan-results
+        path: |
+          trivy-results.json
+          trivy-report.txt
+        retention-days: 30
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.parse.outputs.status }}
+        extra_labels: '{"security_tool": "trivy", "critical": "${{ steps.parse.outputs.critical }}", "high": "${{ steps.parse.outputs.high }}", "total": "${{ steps.parse.outputs.total }}"}'
+        message: "Trivy container scan ${{ steps.parse.outputs.status }}, ${{ steps.parse.outputs.total }} vulnerabilities (${{ steps.parse.outputs.critical }} critical, ${{ steps.parse.outputs.high }} high)"
+
+    - name: Fail if vulnerabilities found
+      shell: bash
+      if: steps.parse.outputs.status == 'failed'
+      run: exit 1

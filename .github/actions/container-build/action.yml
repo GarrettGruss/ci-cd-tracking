@@ -1,0 +1,150 @@
+name: Container Build
+description: Build and optionally push container image, push results to Loki
+
+inputs:
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  context:
+    description: 'Build context path'
+    required: false
+    default: '.'
+  image_name:
+    description: 'Container image name (e.g., ghcr.io/user/repo)'
+    required: true
+  tags:
+    description: 'Image tags (comma-separated)'
+    required: false
+    default: 'latest'
+  push:
+    description: 'Push image to registry'
+    required: false
+    default: 'false'
+  platforms:
+    description: 'Target platforms (comma-separated, e.g., linux/amd64,linux/arm64)'
+    required: false
+    default: 'linux/amd64'
+  build_args:
+    description: 'Build arguments (key=value pairs, one per line)'
+    required: false
+    default: ''
+  registry_username:
+    description: 'Registry username for authentication'
+    required: false
+    default: ''
+  registry_password:
+    description: 'Registry password/token for authentication'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  image_digest:
+    description: 'Image digest (sha256)'
+    value: ${{ steps.build.outputs.digest }}
+  status:
+    description: 'Build status (success/failed)'
+    value: ${{ steps.build.outputs.status }}
+  image_tags:
+    description: 'Full image tags that were built'
+    value: ${{ steps.prepare.outputs.tags }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Container Registry
+      if: inputs.push == 'true' && inputs.registry_username != '' && inputs.registry_password != ''
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.image_name }}
+        username: ${{ inputs.registry_username }}
+        password: ${{ inputs.registry_password }}
+
+    - name: Prepare tags
+      id: prepare
+      shell: bash
+      run: |
+        IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+        FULL_TAGS=""
+        for tag in "${TAG_ARRAY[@]}"; do
+          FULL_TAGS="${FULL_TAGS},${{ inputs.image_name }}:${tag}"
+        done
+        # Remove leading comma
+        FULL_TAGS="${FULL_TAGS:1}"
+        echo "tags=$FULL_TAGS" >> $GITHUB_OUTPUT
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v5
+      continue-on-error: true
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        tags: ${{ steps.prepare.outputs.tags }}
+        build-args: ${{ inputs.build_args }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Set build status
+      id: status
+      shell: bash
+      run: |
+        if [ "${{ steps.build.outcome }}" = "success" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create build summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Container Build Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.status.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Image:** \`${{ inputs.image_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Tags:** \`${{ inputs.tags }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Platforms:** \`${{ inputs.platforms }}\`" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ inputs.push }}" = "true" ]; then
+          echo "**Pushed:** Yes" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "**Pushed:** No (build only)" >> $GITHUB_STEP_SUMMARY
+        fi
+        if [ -n "${{ steps.build.outputs.digest }}" ]; then
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.status.outputs.status }}
+        extra_labels: '{"build_type": "container", "image": "${{ inputs.image_name }}", "pushed": "${{ inputs.push }}", "platforms": "${{ inputs.platforms }}"}'
+        message: "Container build ${{ steps.status.outputs.status }}, image: ${{ inputs.image_name }}, pushed: ${{ inputs.push }}"
+
+    - name: Fail if build failed
+      shell: bash
+      if: steps.status.outputs.status == 'failed'
+      run: exit 1

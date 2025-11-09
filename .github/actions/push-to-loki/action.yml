@@ -1,0 +1,89 @@
+name: Push to Loki
+description: Push GitHub Actions job results to Grafana Loki
+
+inputs:
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+  job_status:
+    description: 'Job status (success, failure, cancelled)'
+    required: true
+  extra_labels:
+    description: 'Additional labels as JSON object (e.g., {"version": "1.0.0"})'
+    required: false
+    default: '{}'
+  message:
+    description: 'Custom log message'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Push to Loki
+      shell: bash
+      run: |
+        TIMESTAMP=$(date +%s)000000000
+
+        # Build auth header if credentials provided
+        if [ -n "${{ inputs.loki_user }}" ] && [ -n "${{ inputs.loki_password }}" ]; then
+          AUTH_HEADER="-u ${{ inputs.loki_user }}:${{ inputs.loki_password }}"
+        else
+          AUTH_HEADER=""
+        fi
+
+        # Merge extra labels
+        EXTRA_LABELS='${{ inputs.extra_labels }}'
+
+        # Build message
+        if [ -n "${{ inputs.message }}" ]; then
+          MESSAGE="${{ inputs.message }}"
+        else
+          MESSAGE="Job: ${{ github.job }}, Status: ${{ inputs.job_status }}, Workflow: ${{ github.workflow }}, Run: ${{ github.run_number }}, Branch: ${{ github.ref_name }}"
+        fi
+
+        # Create labels JSON
+        cat > /tmp/loki-labels.json <<'LABELS_EOF'
+        {
+          "job": "github-actions",
+          "workflow": "${{ github.workflow }}",
+          "job_name": "${{ github.job }}",
+          "repository": "${{ github.repository }}",
+          "branch": "${{ github.ref_name }}",
+          "run_id": "${{ github.run_id }}",
+          "run_number": "${{ github.run_number }}",
+          "status": "${{ inputs.job_status }}"
+        }
+        LABELS_EOF
+
+        # Merge with extra labels if provided
+        if [ "$EXTRA_LABELS" != "{}" ]; then
+          MERGED_LABELS=$(jq -s '.[0] * .[1]' /tmp/loki-labels.json <(echo "$EXTRA_LABELS"))
+        else
+          MERGED_LABELS=$(cat /tmp/loki-labels.json)
+        fi
+
+        # Send to Loki
+        curl -X POST "${{ inputs.loki_url }}/loki/api/v1/push" \
+          -H "Content-Type: application/json" \
+          $AUTH_HEADER \
+          -d @- <<EOF
+        {
+          "streams": [
+            {
+              "stream": $MERGED_LABELS,
+              "values": [
+                ["${TIMESTAMP}", "${MESSAGE}"]
+              ]
+            }
+          ]
+        }
+        EOF

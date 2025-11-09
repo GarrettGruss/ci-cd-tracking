@@ -1,0 +1,119 @@
+name: Run Pip-Audit Vulnerability Scanner
+description: Scan dependencies for known vulnerabilities and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  requirements_file:
+    description: 'Path to requirements file (optional, scans environment if not provided)'
+    required: false
+    default: ''
+  ignore_vulns:
+    description: 'Comma-separated list of vulnerability IDs to ignore'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Vulnerability scan status (passed/failed)'
+    value: ${{ steps.scan.outputs.status }}
+  vulnerabilities:
+    description: 'Number of vulnerabilities found'
+    value: ${{ steps.scan.outputs.vulnerabilities }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+        uv pip install pip-audit
+
+    - name: Run pip-audit
+      id: scan
+      shell: bash
+      continue-on-error: true
+      run: |
+        IGNORE_ARGS=""
+        if [ -n "${{ inputs.ignore_vulns }}" ]; then
+          IFS=',' read -ra VULNS <<< "${{ inputs.ignore_vulns }}"
+          for vuln in "${VULNS[@]}"; do
+            IGNORE_ARGS="$IGNORE_ARGS --ignore-vuln $vuln"
+          done
+        fi
+
+        if [ -n "${{ inputs.requirements_file }}" ]; then
+          uv run pip-audit -r ${{ inputs.requirements_file }} $IGNORE_ARGS -f json -o pip_audit_results.json || true
+          uv run pip-audit -r ${{ inputs.requirements_file }} $IGNORE_ARGS > pip_audit_output.txt 2>&1
+          AUDIT_EXIT_CODE=$?
+        else
+          uv run pip-audit $IGNORE_ARGS -f json -o pip_audit_results.json || true
+          uv run pip-audit $IGNORE_ARGS > pip_audit_output.txt 2>&1
+          AUDIT_EXIT_CODE=$?
+        fi
+
+        # Parse results
+        if [ -f pip_audit_results.json ]; then
+          VULNS=$(python -c "import json; data=json.load(open('pip_audit_results.json')); print(sum(len(v.get('vulnerabilities', [])) for v in data.get('dependencies', [])))")
+          echo "vulnerabilities=$VULNS" >> $GITHUB_OUTPUT
+        else
+          echo "vulnerabilities=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $AUDIT_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat pip_audit_output.txt
+        fi
+        exit $AUDIT_EXIT_CODE
+
+    - name: Upload pip-audit results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pip-audit-vulnerability-report
+        path: |
+          pip_audit_results.json
+          pip_audit_output.txt
+        retention-days: 30
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.scan.outputs.status }}
+        extra_labels: '{"security_tool": "pip_audit", "vulnerabilities": "${{ steps.scan.outputs.vulnerabilities }}"}'
+        message: "Pip-audit vulnerability scan ${{ steps.scan.outputs.status }}, ${{ steps.scan.outputs.vulnerabilities }} vulnerabilities found"
+
+    - name: Fail if vulnerabilities found
+      shell: bash
+      if: steps.scan.outputs.status == 'failed'
+      run: exit 1

@@ -1,0 +1,107 @@
+name: Changelog Validation
+description: Validate CHANGELOG.md is updated and push results to Loki
+
+inputs:
+  changelog_file:
+    description: 'Path to CHANGELOG file'
+    required: false
+    default: 'CHANGELOG.md'
+  base_branch:
+    description: 'Base branch to compare against'
+    required: false
+    default: 'main'
+  require_entry:
+    description: 'Require a changelog entry for PRs'
+    required: false
+    default: 'true'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Changelog validation status (passed/failed)'
+    value: ${{ steps.validate.outputs.status }}
+  entry_found:
+    description: 'Whether a changelog entry was found'
+    value: ${{ steps.validate.outputs.entry_found }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate changelog
+      id: validate
+      shell: bash
+      run: |
+        if [ ! -f "${{ inputs.changelog_file }}" ]; then
+          echo "Changelog file not found: ${{ inputs.changelog_file }}"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "entry_found=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        # Check if CHANGELOG was modified
+        git fetch origin ${{ inputs.base_branch }}
+        CHANGELOG_MODIFIED=$(git diff origin/${{ inputs.base_branch }}...HEAD --name-only | grep -c "${{ inputs.changelog_file }}" || echo "0")
+
+        if [ "$CHANGELOG_MODIFIED" -eq 0 ]; then
+          echo "entry_found=false" >> $GITHUB_OUTPUT
+          if [ "${{ inputs.require_entry }}" = "true" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "CHANGELOG.md was not updated in this PR"
+            exit 1
+          else
+            echo "status=passed" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "entry_found=true" >> $GITHUB_OUTPUT
+          echo "status=passed" >> $GITHUB_OUTPUT
+          echo "CHANGELOG.md has been updated"
+        fi
+
+    - name: Validate changelog format
+      if: steps.validate.outputs.entry_found == 'true'
+      shell: bash
+      run: |
+        # Basic format validation
+        if ! grep -q "##" "${{ inputs.changelog_file }}"; then
+          echo "Warning: CHANGELOG.md appears to be missing section headers"
+        fi
+
+        # Check for version entries
+        if ! grep -qE "^##\s+\[?[0-9]+\.[0-9]+\.[0-9]+\]?" "${{ inputs.changelog_file }}"; then
+          echo "Warning: CHANGELOG.md may not follow semantic versioning format"
+        fi
+
+    - name: Create validation summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Changelog Validation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.validate.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Entry Found:** ${{ steps.validate.outputs.entry_found }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.validate.outputs.status }}
+        extra_labels: '{"check_type": "changelog", "entry_found": "${{ steps.validate.outputs.entry_found }}"}'
+        message: "Changelog validation ${{ steps.validate.outputs.status }}, entry found: ${{ steps.validate.outputs.entry_found }}"
+
+    - name: Fail if changelog validation failed
+      shell: bash
+      if: steps.validate.outputs.status == 'failed'
+      run: exit 1

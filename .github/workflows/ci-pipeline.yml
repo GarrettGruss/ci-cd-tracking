@@ -61,6 +61,15 @@ jobs:
             uv.lock
           retention-days: 7
 
+      - name: Push results to Loki
+        if: always()
+        uses: ./.github/actions/push-to-loki
+        with:
+          loki_url: ${{ secrets.LOKI_URL }}
+          loki_user: ${{ secrets.LOKI_USER }}
+          loki_password: ${{ secrets.LOKI_PASSWORD }}
+          job_status: ${{ job.status }}
+
   semantic-release-dry-run:
     name: Semantic Release Dry Run
     runs-on: ubuntu-latest
@@ -128,3 +137,13 @@ jobs:
               repo: context.repo.repo,
               body: `## 🎯 Semantic Release Preview\n\n**Next Version:** \`${{ steps.next-version.outputs.version }}\`\n\nThis is a dry-run preview. No release will be created from this PR.`
             })
+
+      - name: Push results to Loki
+        if: always()
+        uses: ./.github/actions/push-to-loki
+        with:
+          loki_url: ${{ secrets.LOKI_URL }}
+          loki_user: ${{ secrets.LOKI_USER }}
+          loki_password: ${{ secrets.LOKI_PASSWORD }}
+          job_status: ${{ job.status }}
+          extra_labels: '{"next_version": "${{ steps.next-version.outputs.version }}"}'

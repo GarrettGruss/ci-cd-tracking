@@ -1,0 +1,94 @@
+name: Run Ruff Format
+description: Run ruff format check and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  check_only:
+    description: 'Only check formatting, do not modify files'
+    required: false
+    default: 'true'
+  path:
+    description: 'Path to format (default: .)'
+    required: false
+    default: '.'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Format check status (passed/failed)'
+    value: ${{ steps.format.outputs.status }}
+  files_changed:
+    description: 'Number of files that need formatting'
+    value: ${{ steps.format.outputs.files_changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv sync
+
+    - name: Run ruff format
+      id: format
+      shell: bash
+      continue-on-error: true
+      run: |
+        if [ "${{ inputs.check_only }}" = "true" ]; then
+          uv run ruff format --check ${{ inputs.path }} > ruff_format_output.txt 2>&1
+          FORMAT_EXIT_CODE=$?
+        else
+          uv run ruff format ${{ inputs.path }} > ruff_format_output.txt 2>&1
+          FORMAT_EXIT_CODE=$?
+        fi
+
+        # Count files that need formatting
+        FILES_CHANGED=$(grep -c "Would reformat" ruff_format_output.txt || echo "0")
+        echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+
+        if [ $FORMAT_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat ruff_format_output.txt
+        fi
+        exit $FORMAT_EXIT_CODE
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.format.outputs.status }}
+        extra_labels: '{"check_type": "ruff_format", "files_changed": "${{ steps.format.outputs.files_changed }}"}'
+        message: "Ruff format ${{ steps.format.outputs.status }}, ${{ steps.format.outputs.files_changed }} files need formatting"
+
+    - name: Fail if format check failed
+      shell: bash
+      if: steps.format.outputs.status == 'failed'
+      run: exit 1

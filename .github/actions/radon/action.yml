@@ -1,0 +1,130 @@
+name: Run Radon Complexity Analysis
+description: Analyze code complexity with radon and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  path:
+    description: 'Path to analyze'
+    required: false
+    default: 'src'
+  complexity_threshold:
+    description: 'Maximum cyclomatic complexity allowed (A=1-5, B=6-10, C=11-20, D=21-50, E=51-100, F=100+)'
+    required: false
+    default: 'C'
+  maintainability_threshold:
+    description: 'Minimum maintainability index (0-100, higher is better)'
+    required: false
+    default: '20'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Analysis status (passed/failed)'
+    value: ${{ steps.analyze.outputs.status }}
+  average_complexity:
+    description: 'Average complexity score'
+    value: ${{ steps.analyze.outputs.avg_complexity }}
+  average_maintainability:
+    description: 'Average maintainability index'
+    value: ${{ steps.analyze.outputs.avg_maintainability }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Install radon
+      shell: bash
+      run: |
+        uv pip install radon
+
+    - name: Run radon complexity analysis
+      id: analyze
+      shell: bash
+      continue-on-error: true
+      run: |
+        # Cyclomatic complexity
+        uv run radon cc ${{ inputs.path }} -s -j > radon_cc.json
+        uv run radon cc ${{ inputs.path }} -s --min ${{ inputs.complexity_threshold }} > radon_cc.txt 2>&1
+        CC_EXIT_CODE=$?
+
+        # Maintainability index
+        uv run radon mi ${{ inputs.path }} -s -j > radon_mi.json
+        uv run radon mi ${{ inputs.path }} -s --min ${{ inputs.maintainability_threshold }} > radon_mi.txt 2>&1
+        MI_EXIT_CODE=$?
+
+        # Calculate averages
+        if [ -f radon_cc.json ]; then
+          AVG_CC=$(python -c "import json; data=json.load(open('radon_cc.json')); scores=[item['complexity'] for file in data.values() for item in file if isinstance(item, dict) and 'complexity' in item]; print(sum(scores)/len(scores) if scores else 0)")
+          echo "avg_complexity=$AVG_CC" >> $GITHUB_OUTPUT
+        else
+          echo "avg_complexity=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ -f radon_mi.json ]; then
+          AVG_MI=$(python -c "import json; data=json.load(open('radon_mi.json')); scores=[item['mi'] for file in data.values() for item in file if isinstance(item, dict) and 'mi' in item]; print(sum(scores)/len(scores) if scores else 0)")
+          echo "avg_maintainability=$AVG_MI" >> $GITHUB_OUTPUT
+        else
+          echo "avg_maintainability=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $CC_EXIT_CODE -eq 0 ] && [ $MI_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "=== Complexity Issues ==="
+          cat radon_cc.txt
+          echo "=== Maintainability Issues ==="
+          cat radon_mi.txt
+        fi
+
+        exit $((CC_EXIT_CODE + MI_EXIT_CODE))
+
+    - name: Upload radon results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: radon-complexity-report
+        path: |
+          radon_cc.json
+          radon_mi.json
+          radon_cc.txt
+          radon_mi.txt
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.analyze.outputs.status }}
+        extra_labels: '{"check_type": "complexity", "avg_complexity": "${{ steps.analyze.outputs.avg_complexity }}", "avg_maintainability": "${{ steps.analyze.outputs.avg_maintainability }}"}'
+        message: "Radon complexity analysis ${{ steps.analyze.outputs.status }}, avg complexity: ${{ steps.analyze.outputs.avg_complexity }}, avg maintainability: ${{ steps.analyze.outputs.avg_maintainability }}"
+
+    - name: Fail if complexity issues found
+      shell: bash
+      if: steps.analyze.outputs.status == 'failed'
+      run: exit 1

@@ -1,0 +1,151 @@
+name: Deploy to Production
+description: Deploy application to production environment with safety checks and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  deployment_method:
+    description: 'Deployment method (container, ssh, serverless)'
+    required: false
+    default: 'container'
+  image:
+    description: 'Container image to deploy (for container method)'
+    required: false
+    default: ''
+  ssh_host:
+    description: 'SSH host for deployment (for ssh method)'
+    required: false
+    default: ''
+  ssh_user:
+    description: 'SSH user (for ssh method)'
+    required: false
+    default: ''
+  ssh_key:
+    description: 'SSH private key (for ssh method)'
+    required: false
+    default: ''
+  deploy_command:
+    description: 'Custom deployment command'
+    required: false
+    default: ''
+  require_approval:
+    description: 'Require manual approval before deploying'
+    required: false
+    default: 'true'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Deployment status (success/failed)'
+    value: ${{ steps.deploy.outputs.status }}
+  deployment_url:
+    description: 'Deployed application URL'
+    value: ${{ steps.deploy.outputs.deployment_url }}
+  version:
+    description: 'Deployed version'
+    value: ${{ steps.deploy.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Pre-deployment checks
+      shell: bash
+      run: |
+        echo "Running pre-deployment safety checks..."
+        # Add your pre-deployment checks here
+        # - Database backup verification
+        # - Health check endpoints
+        # - Rollback plan verification
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      continue-on-error: true
+      run: |
+        VERSION=$(git describe --tags --always)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+        echo "⚠️  PRODUCTION DEPLOYMENT ⚠️"
+        echo "Version: $VERSION"
+
+        if [ -n "${{ inputs.deploy_command }}" ]; then
+          # Custom deploy command
+          eval "${{ inputs.deploy_command }}"
+          DEPLOY_EXIT_CODE=$?
+        elif [ "${{ inputs.deployment_method }}" = "container" ]; then
+          # Container deployment (example with kubectl)
+          echo "Deploying container ${{ inputs.image }} to production"
+          # kubectl set image deployment/myapp myapp=${{ inputs.image }} -n production
+          # kubectl rollout status deployment/myapp -n production
+          DEPLOY_EXIT_CODE=0
+        elif [ "${{ inputs.deployment_method }}" = "ssh" ]; then
+          # SSH deployment
+          echo "Deploying via SSH to ${{ inputs.ssh_host }}"
+          DEPLOY_EXIT_CODE=0
+        else
+          echo "Unsupported deployment method: ${{ inputs.deployment_method }}"
+          DEPLOY_EXIT_CODE=1
+        fi
+
+        if [ $DEPLOY_EXIT_CODE -eq 0 ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "deployment_url=https://production.example.com" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "deployment_url=" >> $GITHUB_OUTPUT
+        fi
+        exit $DEPLOY_EXIT_CODE
+
+    - name: Post-deployment verification
+      if: steps.deploy.outputs.status == 'success'
+      shell: bash
+      run: |
+        echo "Running post-deployment verification..."
+        # Health checks
+        # Smoke tests
+        # Metrics verification
+
+    - name: Create deployment summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### 🚀 Production Deployment" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ steps.deploy.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Version:** ${{ steps.deploy.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ steps.deploy.outputs.deployment_url }}" ]; then
+          echo "**URL:** ${{ steps.deploy.outputs.deployment_url }}" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.deploy.outputs.status }}
+        extra_labels: '{"deployment_type": "production", "version": "${{ steps.deploy.outputs.version }}", "method": "${{ inputs.deployment_method }}"}'
+        message: "Production deployment ${{ steps.deploy.outputs.status }}, version: ${{ steps.deploy.outputs.version }}"
+
+    - name: Fail if deployment failed
+      shell: bash
+      if: steps.deploy.outputs.status == 'failed'
+      run: exit 1

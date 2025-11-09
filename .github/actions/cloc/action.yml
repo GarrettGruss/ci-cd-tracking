@@ -1,0 +1,237 @@
+name: Count Lines of Code
+description: Count lines of code with cloc and push results to Loki
+
+inputs:
+  path:
+    description: 'Path to analyze (default: .)'
+    required: false
+    default: '.'
+  exclude_dirs:
+    description: 'Comma-separated list of directories to exclude'
+    required: false
+    default: 'node_modules,.venv,venv,dist,build,__pycache__,.git'
+  output_format:
+    description: 'Output format (json, yaml, csv, xml)'
+    required: false
+    default: 'json'
+  by_file:
+    description: 'Count lines by individual file'
+    required: false
+    default: 'false'
+  include_languages:
+    description: 'Comma-separated list of languages to include (empty = all)'
+    required: false
+    default: ''
+  baseline_file:
+    description: 'Path to baseline cloc results for comparison'
+    required: false
+    default: ''
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Analysis status (success/failed)'
+    value: ${{ steps.count.outputs.status }}
+  total_lines:
+    description: 'Total lines of code'
+    value: ${{ steps.count.outputs.total_lines }}
+  code_lines:
+    description: 'Lines of code (excluding comments and blanks)'
+    value: ${{ steps.count.outputs.code_lines }}
+  comment_lines:
+    description: 'Lines of comments'
+    value: ${{ steps.count.outputs.comment_lines }}
+  blank_lines:
+    description: 'Blank lines'
+    value: ${{ steps.count.outputs.blank_lines }}
+  files_counted:
+    description: 'Number of files analyzed'
+    value: ${{ steps.count.outputs.files_counted }}
+  languages_found:
+    description: 'Number of programming languages detected'
+    value: ${{ steps.count.outputs.languages_found }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install cloc
+      shell: bash
+      run: |
+        # Install cloc (Count Lines of Code)
+        if command -v apt-get &> /dev/null; then
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloc
+        elif command -v brew &> /dev/null; then
+          brew install cloc
+        else
+          # Download from GitHub releases
+          wget https://github.com/AlDanial/cloc/releases/download/v2.00/cloc-2.00.pl -O /tmp/cloc
+          chmod +x /tmp/cloc
+          sudo mv /tmp/cloc /usr/local/bin/cloc
+        fi
+
+    - name: Count lines of code
+      id: count
+      shell: bash
+      continue-on-error: true
+      run: |
+        # Build exclude arguments
+        EXCLUDE_ARGS=""
+        if [ -n "${{ inputs.exclude_dirs }}" ]; then
+          IFS=',' read -ra DIRS <<< "${{ inputs.exclude_dirs }}"
+          for dir in "${DIRS[@]}"; do
+            EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude-dir=$dir"
+          done
+        fi
+
+        # Build include languages arguments
+        INCLUDE_ARGS=""
+        if [ -n "${{ inputs.include_languages }}" ]; then
+          INCLUDE_ARGS="--include-lang=${{ inputs.include_languages }}"
+        fi
+
+        # By file option
+        BY_FILE_ARG=""
+        if [ "${{ inputs.by_file }}" = "true" ]; then
+          BY_FILE_ARG="--by-file"
+        fi
+
+        # Run cloc
+        cloc ${{ inputs.path }} \
+          $EXCLUDE_ARGS \
+          $INCLUDE_ARGS \
+          $BY_FILE_ARG \
+          --${{ inputs.output_format }} \
+          --out=cloc-results.${{ inputs.output_format }} \
+          --report-file=cloc-report.txt
+
+        CLOC_EXIT_CODE=$?
+
+        # Also generate JSON for parsing
+        if [ "${{ inputs.output_format }}" != "json" ]; then
+          cloc ${{ inputs.path }} \
+            $EXCLUDE_ARGS \
+            $INCLUDE_ARGS \
+            --json \
+            --out=cloc-results.json
+        fi
+
+        # Parse results from JSON
+        if [ -f cloc-results.json ]; then
+          # Extract summary statistics
+          TOTAL_LINES=$(jq -r '.SUM.code + .SUM.comment + .SUM.blank' cloc-results.json 2>/dev/null || echo "0")
+          CODE_LINES=$(jq -r '.SUM.code // 0' cloc-results.json)
+          COMMENT_LINES=$(jq -r '.SUM.comment // 0' cloc-results.json)
+          BLANK_LINES=$(jq -r '.SUM.blank // 0' cloc-results.json)
+          FILES_COUNTED=$(jq -r '.SUM.nFiles // 0' cloc-results.json)
+          LANGUAGES_FOUND=$(jq -r 'keys | length - 1' cloc-results.json)  # -1 to exclude SUM
+
+          echo "total_lines=$TOTAL_LINES" >> $GITHUB_OUTPUT
+          echo "code_lines=$CODE_LINES" >> $GITHUB_OUTPUT
+          echo "comment_lines=$COMMENT_LINES" >> $GITHUB_OUTPUT
+          echo "blank_lines=$BLANK_LINES" >> $GITHUB_OUTPUT
+          echo "files_counted=$FILES_COUNTED" >> $GITHUB_OUTPUT
+          echo "languages_found=$LANGUAGES_FOUND" >> $GITHUB_OUTPUT
+        else
+          echo "total_lines=0" >> $GITHUB_OUTPUT
+          echo "code_lines=0" >> $GITHUB_OUTPUT
+          echo "comment_lines=0" >> $GITHUB_OUTPUT
+          echo "blank_lines=0" >> $GITHUB_OUTPUT
+          echo "files_counted=0" >> $GITHUB_OUTPUT
+          echo "languages_found=0" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $CLOC_EXIT_CODE -eq 0 ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+        fi
+
+        # Display results
+        cat cloc-report.txt
+
+        exit $CLOC_EXIT_CODE
+
+    - name: Compare with baseline
+      if: inputs.baseline_file != ''
+      id: compare
+      shell: bash
+      run: |
+        if [ ! -f "${{ inputs.baseline_file }}" ]; then
+          echo "Baseline file not found: ${{ inputs.baseline_file }}"
+        else
+          echo "### Comparison with Baseline" >> comparison.txt
+          cloc --diff ${{ inputs.baseline_file }} cloc-results.json >> comparison.txt
+          cat comparison.txt
+        fi
+
+    - name: Create code metrics summary
+      if: always()
+      shell: bash
+      run: |
+        echo "### Lines of Code Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Total Lines:** ${{ steps.count.outputs.total_lines }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Code Lines:** ${{ steps.count.outputs.code_lines }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Comment Lines:** ${{ steps.count.outputs.comment_lines }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Blank Lines:** ${{ steps.count.outputs.blank_lines }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Files Analyzed:** ${{ steps.count.outputs.files_counted }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Languages Detected:** ${{ steps.count.outputs.languages_found }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Calculate percentages
+        TOTAL=${{ steps.count.outputs.total_lines }}
+        if [ "$TOTAL" -gt 0 ]; then
+          CODE_PCT=$(echo "scale=1; (${{ steps.count.outputs.code_lines }} / $TOTAL) * 100" | bc)
+          COMMENT_PCT=$(echo "scale=1; (${{ steps.count.outputs.comment_lines }} / $TOTAL) * 100" | bc)
+          BLANK_PCT=$(echo "scale=1; (${{ steps.count.outputs.blank_lines }} / $TOTAL) * 100" | bc)
+
+          echo "**Breakdown:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Code: ${CODE_PCT}%" >> $GITHUB_STEP_SUMMARY
+          echo "- Comments: ${COMMENT_PCT}%" >> $GITHUB_STEP_SUMMARY
+          echo "- Blanks: ${BLANK_PCT}%" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Top languages
+        if [ -f cloc-results.json ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Top Languages:**" >> $GITHUB_STEP_SUMMARY
+          jq -r 'to_entries | map(select(.key != "SUM" and .key != "header")) | sort_by(-.value.code) | limit(5;.[]) | "- \(.key): \(.value.code) lines"' cloc-results.json >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Upload cloc results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cloc-results
+        path: |
+          cloc-results.*
+          cloc-report.txt
+          comparison.txt
+        retention-days: 30
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.count.outputs.status }}
+        extra_labels: '{"metric_type": "lines_of_code", "total_lines": "${{ steps.count.outputs.total_lines }}", "code_lines": "${{ steps.count.outputs.code_lines }}", "comment_lines": "${{ steps.count.outputs.comment_lines }}", "files": "${{ steps.count.outputs.files_counted }}", "languages": "${{ steps.count.outputs.languages_found }}"}'
+        message: "Lines of code analysis ${{ steps.count.outputs.status }}, total: ${{ steps.count.outputs.total_lines }}, code: ${{ steps.count.outputs.code_lines }}, comments: ${{ steps.count.outputs.comment_lines }}, files: ${{ steps.count.outputs.files_counted }}"
+
+    - name: Fail if analysis failed
+      shell: bash
+      if: steps.count.outputs.status == 'failed'
+      run: exit 1

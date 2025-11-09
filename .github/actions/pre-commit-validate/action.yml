@@ -1,0 +1,117 @@
+name: Pre-commit Validation
+description: Validate pre-commit hooks and push results to Loki
+
+inputs:
+  python_version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+  config_file:
+    description: 'Pre-commit config file path'
+    required: false
+    default: '.pre-commit-config.yaml'
+  run_on_all_files:
+    description: 'Run on all files instead of changed files only'
+    required: false
+    default: 'true'
+  loki_url:
+    description: 'Loki endpoint URL'
+    required: true
+  loki_user:
+    description: 'Loki username for basic auth'
+    required: false
+    default: ''
+  loki_password:
+    description: 'Loki password for basic auth'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Pre-commit validation status (passed/failed)'
+    value: ${{ steps.validate.outputs.status }}
+  hooks_run:
+    description: 'Number of hooks executed'
+    value: ${{ steps.validate.outputs.hooks_run }}
+  hooks_failed:
+    description: 'Number of hooks that failed'
+    value: ${{ steps.validate.outputs.hooks_failed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install pre-commit
+      shell: bash
+      run: |
+        pip install pre-commit
+
+    - name: Cache pre-commit
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pre-commit
+        key: pre-commit-${{ hashFiles(inputs.config_file) }}
+
+    - name: Run pre-commit
+      id: validate
+      shell: bash
+      continue-on-error: true
+      run: |
+        if [ ! -f "${{ inputs.config_file }}" ]; then
+          echo "Pre-commit config not found: ${{ inputs.config_file }}"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "hooks_run=0" >> $GITHUB_OUTPUT
+          echo "hooks_failed=0" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        if [ "${{ inputs.run_on_all_files }}" = "true" ]; then
+          pre-commit run --all-files > pre-commit-output.txt 2>&1
+          PRECOMMIT_EXIT_CODE=$?
+        else
+          pre-commit run > pre-commit-output.txt 2>&1
+          PRECOMMIT_EXIT_CODE=$?
+        fi
+
+        # Count hooks
+        HOOKS_RUN=$(grep -c "^.\+\.\.\.\.\.\." pre-commit-output.txt || echo "0")
+        HOOKS_FAILED=$(grep -c "Failed" pre-commit-output.txt || echo "0")
+
+        echo "hooks_run=$HOOKS_RUN" >> $GITHUB_OUTPUT
+        echo "hooks_failed=$HOOKS_FAILED" >> $GITHUB_OUTPUT
+
+        if [ $PRECOMMIT_EXIT_CODE -eq 0 ]; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          cat pre-commit-output.txt
+        fi
+        exit $PRECOMMIT_EXIT_CODE
+
+    - name: Upload pre-commit results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pre-commit-results
+        path: pre-commit-output.txt
+        retention-days: 7
+
+    - name: Push results to Loki
+      if: always()
+      uses: ./.github/actions/push-to-loki
+      with:
+        loki_url: ${{ inputs.loki_url }}
+        loki_user: ${{ inputs.loki_user }}
+        loki_password: ${{ inputs.loki_password }}
+        job_status: ${{ steps.validate.outputs.status }}
+        extra_labels: '{"check_type": "pre_commit", "hooks_run": "${{ steps.validate.outputs.hooks_run }}", "hooks_failed": "${{ steps.validate.outputs.hooks_failed }}"}'
+        message: "Pre-commit validation ${{ steps.validate.outputs.status }}, ${{ steps.validate.outputs.hooks_run }} hooks run, ${{ steps.validate.outputs.hooks_failed }} failed"
+
+    - name: Fail if pre-commit failed
+      shell: bash
+      if: steps.validate.outputs.status == 'failed'
+      run: exit 1
