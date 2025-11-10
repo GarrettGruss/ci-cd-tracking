@@ -14,6 +14,7 @@ A reusable GitHub Actions composite action that sends job results and metadata t
 - Optional basic authentication
 - Runs even if previous steps fail (`if: always()`)
 - Merges extra labels with standard labels
+- Echoes the log body before pushing for debugging purposes
 
 ## Inputs
 

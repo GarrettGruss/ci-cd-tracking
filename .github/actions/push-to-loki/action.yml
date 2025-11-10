@@ -71,11 +71,8 @@ runs:
           MERGED_LABELS=$(cat /tmp/loki-labels.json)
         fi
 
-        # Send to Loki
-        curl -X POST "${{ inputs.loki_url }}/loki/api/v1/push" \
-          -H "Content-Type: application/json" \
-          $AUTH_HEADER \
-          -d @- <<EOF
+        # Build the log body
+        LOG_BODY=$(cat <<EOF
         {
           "streams": [
             {
@@ -87,3 +84,14 @@ runs:
           ]
         }
         EOF
+        )
+
+        # Echo the log body for debugging
+        echo "Pushing to Loki:"
+        echo "$LOG_BODY"
+
+        # Send to Loki
+        curl -X POST "${{ inputs.loki_url }}/loki/api/v1/push" \
+          -H "Content-Type: application/json" \
+          $AUTH_HEADER \
+          -d "$LOG_BODY"
